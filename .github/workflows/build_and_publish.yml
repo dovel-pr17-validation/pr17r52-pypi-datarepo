@@ -1,0 +1,152 @@
+name: Test, Build and Publish datarepo
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+  release:
+    types: [created]
+  workflow_dispatch:  # Allows manual triggering
+
+permissions:
+  contents: write
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python3.10 -m pip install --upgrade pip
+        python3.10 -m pip install --no-cache-dir -e ".[dev]"
+    
+    - name: Run tests with coverage
+      run: |
+        pytest test --cov=src/datarepo --cov-report=term-missing
+
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+    
+    - name: Run flake8
+      run: |
+        flake8 src/datarepo --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 src/datarepo --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Run black
+      run: |
+        black --check src/datarepo
+    
+    - name: Run mypy
+      run: |
+        mypy src/datarepo
+
+  build-and-publish:
+    needs: [run-tests, code-quality]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ci
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+      
+      - name: Check if version exists in PyPI
+        id: version_check
+        run: |
+          CURRENT_VERSION=$(grep '^version = ' pyproject.toml | cut -d'"' -f2)
+          echo "Checking if version $CURRENT_VERSION exists in PyPI"
+          if pip index versions data-repository | grep -q "$CURRENT_VERSION"; then
+            echo "Version $CURRENT_VERSION already exists in PyPI"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "Version $CURRENT_VERSION is new"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+      
+      - name: Build package
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          python -m build
+      
+      - name: Publish package to PyPI
+        if: steps.version_check.outputs.should_build == 'true'
+        env:
+          TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+        run: |
+          echo "TWINE_PASSWORD is set: $([ ! -z "$TWINE_PASSWORD" ] && echo "yes" || echo "no")"
+          python -m twine upload --username __token__ --password "$TWINE_PASSWORD" dist/* --verbose
+
+  build-and-publish-docs:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mkdocs-material mkdocstrings[python] "pymdown-extensions<12.2"
+      
+      - name: Build web catalog
+        run: |
+          pip install -e .
+          cd docs/examples/
+          mkdir web_catalog
+          python generate_tpc_site.py --output-dir web_catalog
+
+      - name: Build documentation
+        run: |
+          mkdocs build
+      
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          publish_branch: gh-pages
+          cname: data-repo.io
